@@ -49,6 +49,19 @@ except ImportError:  # pragma: no cover
     sys.stderr.write(json.dumps({"event": "error", "message": "Missing dependency: pip install requests beautifulsoup4"}) + "\n")
     sys.exit(5)
 
+_NAT64 = ipaddress.ip_network("64:ff9b::/96")   # RFC 6052 well-known NAT64 prefix
+
+
+def _effective_ip(ip):
+    """NAT64 / IPv4-mapped IPv6 addresses embed a real IPv4 address: judge that one."""
+    if ip.version == 6:
+        if ip.ipv4_mapped:
+            return ip.ipv4_mapped
+        if ip in _NAT64:
+            return ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+    return ip
+
+
 TOOL_NAME = "sitecrawl"
 TOOL_VERSION = "1.0.0"
 
@@ -102,7 +115,7 @@ def host_is_public(host: str) -> tuple[bool, str]:
     except socket.gaierror:
         return False, f"DNS lookup failed for '{host}'"
     for info in infos:
-        ip = ipaddress.ip_address(info[4][0].split("%")[0])
+        ip = _effective_ip(ipaddress.ip_address(info[4][0].split("%")[0]))
         if (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast
                 or ip.is_reserved or ip.is_unspecified):
             return False, f"'{host}' resolves to a non-public address ({ip})"

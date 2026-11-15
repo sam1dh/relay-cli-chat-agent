@@ -12,6 +12,19 @@ URL_RE = re.compile(r"(?<![@\w.-])((?:https?://)?(?:[a-z0-9](?:[a-z0-9-]{0,61}[a
 LOCAL_URL_RE = re.compile(r"\b(https?://(?:localhost|127\.0\.0\.1)(?::\d{2,5})?(?:/[^\s<>\"'`]*)?)", re.I)
 
 
+_NAT64 = ipaddress.ip_network("64:ff9b::/96")   # RFC 6052 well-known NAT64 prefix
+
+
+def _effective_ip(ip):
+    """NAT64 / IPv4-mapped IPv6 addresses embed a real IPv4 address: judge that one."""
+    if ip.version == 6:
+        if ip.ipv4_mapped:
+            return ip.ipv4_mapped
+        if ip in _NAT64:
+            return ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+    return ip
+
+
 class ValidationError(ValueError):
     pass
 
@@ -67,10 +80,10 @@ def _ensure_public(host: str) -> None:
     except socket.gaierror:
         raise ValidationError(f"The domain '{host}' could not be resolved (DNS lookup failed).") from None
     for info in infos:
-        ip = ipaddress.ip_address(info[4][0].split("%")[0])
+        ip = _effective_ip(ipaddress.ip_address(info[4][0].split("%")[0]))
         if (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast
                 or ip.is_reserved or ip.is_unspecified):
-            raise ValidationError(f"'{host}' points to a private/internal address; crawling it is blocked.")
+            raise ValidationError(f"'{host}' points to a private/internal address ({ip}); crawling it is blocked.")
 
 
 def clamp(value, lo: int, hi: int, default: int) -> int:

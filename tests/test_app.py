@@ -262,3 +262,12 @@ def test_crawl4ai_garbage_output_falls_back(site, fake_crwl, monkeypatch):
     monkeypatch.setenv("FAKE_CRWL_MODE", "garbage")
     _, final = chat(TestClient(app), f"crawl {site}/")
     assert final["json"]["execution"]["tool"] == "crawl_site"
+
+
+def test_nat64_and_mapped_addresses_judged_by_embedded_ipv4():
+    import ipaddress
+    from backend.validators import _effective_ip
+    assert str(_effective_ip(ipaddress.ip_address("64:ff9b::23d3:7a6d"))) == "35.211.122.109"   # public -> allowed
+    assert _effective_ip(ipaddress.ip_address("64:ff9b::a00:1")).is_private                       # 10.0.0.1 -> still blocked
+    assert _effective_ip(ipaddress.ip_address("::ffff:127.0.0.1")).is_loopback                     # mapped loopback blocked
+    assert _effective_ip(ipaddress.ip_address("64:ff9b::a9fe:a9fe")).is_link_local                 # 169.254.169.254 blocked
