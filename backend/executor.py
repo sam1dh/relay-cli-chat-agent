@@ -28,6 +28,7 @@ from .tools import ToolSpec
 SECRET_ENV = re.compile(r"(KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|AUTH|COOKIE|SESSION)", re.I)
 MAX_CAPTURE_LINES = 2000
 JSONISH = re.compile(r'^\s|^[{}\]"]|^\[\s*($|[{\["\d-])')   # JSON dump fragments, not log lines
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
 
 @dataclass
@@ -73,6 +74,9 @@ def safe_env() -> dict[str, str]:
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
     env["CRAWL4AI_NO_CLOUD_NOTICE"] = "1"   # keep crwl's promo banner out of the logs            # Windows: let child CLIs (e.g. Crawl4AI's rich logs) print unicode safely
+    env["COLUMNS"] = "220"   # rich (used by crwl) wraps at 80 cols when piped
+    env["NO_COLOR"] = "1"
+    env["TERM"] = "dumb"
     env["PYTHONUNBUFFERED"] = "1"
     return env
 
@@ -125,7 +129,7 @@ def _reader(stream, name: str, q: queue.Queue, sink: list[str], log_path: Path) 
     try:
         with open(log_path, "w", encoding="utf-8") as fh:   # full stream always saved as evidence
             for line in iter(stream.readline, ""):
-                line = line.rstrip("\r\n")
+                line = ANSI.sub("", line.rstrip("\r\n"))
                 fh.write(line + "\n")
                 if len(sink) < MAX_CAPTURE_LINES:
                     sink.append(line)

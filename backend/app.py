@@ -96,8 +96,9 @@ def run_file(run_id: str, name: str):
         path = config.RUNS_DIR / run_id / "crawl4ai.json"   # Crawl4AI writes its own output file
     if not path.exists():
         raise HTTPException(404, "not found")
-    media = "application/json" if path.suffix == ".json" else "text/plain"
-    return FileResponse(path, media_type=media, filename=f"{run_id}-{files[name]}")
+    media = "application/json" if path.suffix == ".json" else "text/plain; charset=utf-8"
+    return FileResponse(path, media_type=media, filename=f"{run_id}-{path.name}",
+                        content_disposition_type="inline")
 
 
 @app.exception_handler(Exception)

@@ -17,4 +17,5 @@ else
   crawl4ai-setup                                  # Debian/Ubuntu/macOS: installs browser + deps
 fi
 
+crwl config set VERBOSE true || true
 crwl --help >/dev/null && echo ">> Crawl4AI ready. Restart ./run.sh - the sidebar will show crawl4ai as available."

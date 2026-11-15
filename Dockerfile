@@ -28,6 +28,8 @@ RUN if [ "$WITH_CRAWL4AI" = "1" ]; then \
 RUN useradd -m -u 1000 appuser
 COPY --chown=appuser:appuser . .
 USER appuser
+# Crawl4AI prints per-page [FETCH]/[SCRAPE]/[COMPLETE] logs only when VERBOSE is on
+RUN if [ "$WITH_CRAWL4AI" = "1" ]; then CRAWL4AI_NO_CLOUD_NOTICE=1 crwl config set VERBOSE true || true ; fi
 EXPOSE 7860
 
 # Hugging Face uses 7860; Render/Railway inject $PORT.

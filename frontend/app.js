@@ -211,7 +211,15 @@ class Turn {
     if (!this.exec) return;
     const p = ev.parsed;
     if (ev.stream === "system") return this.line("sys", "[system] " + ev.line);
-    if (!p) return this.line(ev.stream === "stdout" ? "out" : "", (this.exec.tool === "crawl4ai" ? "[crwl] " : "[stderr] ") + ev.line);
+    if (!p) {
+      if (this.exec.tool === "crawl4ai") {
+        const tag = (ev.line.match(/^\[(\w+)\]/) || [])[1];
+        if (tag === "COMPLETE") this.bumpPages();
+        const cls = tag === "COMPLETE" ? "ok" : tag === "FETCH" ? "fetch" : tag === "ERROR" ? "err" : "out";
+        return this.line(cls, ev.line);
+      }
+      return this.line(ev.stream === "stdout" ? "out" : "", "[stderr] " + ev.line);
+    }
     const pr = this.exec.card.querySelector(".pl"), bar = this.exec.card.querySelector(".track i");
     switch (p.event) {
       case "start": return this.line("", `[start] ${p.tool} v${p.version} → ${p.url} (max ${p.max_pages} pages, depth ${p.max_depth})`);
@@ -219,8 +227,7 @@ class Turn {
       case "fetch": Ins.depth = Math.max(Ins.depth, p.depth); Ins.meter("Depth", Ins.depth, Ins.max.d); return this.line("fetch", `→ GET ${p.url}   page ${p.n}/${p.max} · depth ${p.depth}`);
       case "redirect": return this.line("", `  ↪ redirect → ${p.to}`);
       case "page_ok":
-        this.exec.pages++; Ins.pages = this.exec.pages; Ins.meter("Pages", Ins.pages, Ins.max.p);
-        if (pr) pr.textContent = `PAGES ${this.exec.pages} / ${this.planData?.max_pages}`; if (bar) bar.style.width = Math.min(100, (this.exec.pages / (this.planData?.max_pages || 1)) * 100) + "%";
+        this.bumpPages();
         return this.line("ok", `  ✓ ${p.title || "(no title)"} · ${p.words} words · ${p.ms} ms`);
       case "page_error": return this.line("err", `  ✗ ${p.url}: ${p.error}`);
       case "skip": return this.line("", `  – skipped ${p.url} (${p.reason})`);
@@ -229,6 +236,15 @@ class Turn {
       case "error": Ins.check("robots", !/robots/.test(p.message), /robots/.test(p.message) ? "blocked" : "ok"); return this.line("err", `[error] ${p.message}`);
       default: return this.line("", ev.line);
     }
+  }
+  bumpPages(setTo) {
+    if (!this.exec) return;
+    this.exec.pages = setTo ?? this.exec.pages + 1;
+    const max = this.planData?.max_pages || 1;
+    Ins.pages = this.exec.pages; Ins.meter("Pages", Ins.pages, Ins.max.p);
+    const pr = this.exec.card.querySelector(".pl"), bar = this.exec.card.querySelector(".track i");
+    if (pr) pr.textContent = `PAGES ${this.exec.pages} / ${max}`;
+    if (bar) bar.style.width = Math.min(100, (this.exec.pages / max) * 100) + "%";
   }
   execEnd(ev) {
     this.stopTimer();
@@ -313,6 +329,7 @@ class Turn {
       addRun(this.message, ev.status, exec ? `${ev.status} · exit ${exec.exit_code ?? "-"} · ${TOOL_LABEL[exec.tool] || exec.tool}` : "rejected · " + (ev.text || "").replace(/^I couldn't start the task: /, "").slice(0, 40));
     } else {
       const sm = ev.summary || {}, data = env?.data || {};
+      if (data.stats && this.exec) this.bumpPages(data.stats.pages_crawled);
       card.querySelector(".headline").textContent = ev.headline || "Completed";
       card.querySelector(".rby").textContent = sm.generated_by === "llm" ? `Summary by ${health?.llm?.replace(/^.*\((.*)\)$/, "$1") || "LLM"}` : "Extractive summary (no LLM)";
       const stats = card.querySelector(".stats");
