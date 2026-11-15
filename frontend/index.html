@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Relay · CLI Chat Agent</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,600;12..96,700&family=IBM+Plex+Mono:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=Instrument+Serif:ital@1&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+<div class="app">
+  <!-- ============ SIDEBAR ============ -->
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="logo">&gt;_</div>
+      <div><div class="brand-name">Relay</div><div class="brand-sub">CLI CHAT AGENT</div></div>
+    </div>
+    <button class="new-task" id="newTask" type="button"><span>+&nbsp; New task</span><kbd>Ctrl K</kbd></button>
+
+    <div class="side-label">RECENT RUNS</div>
+    <div class="runs" id="runs"><p class="side-empty">Your runs will appear here.</p></div>
+
+    <div class="side-label">APPROVED TOOLS</div>
+    <div class="tools" id="tools"></div>
+
+    <div class="spacer"></div>
+    <div class="guard">
+      <div class="side-label tight">GUARDRAILS</div>
+      <ul>
+        <li>No shell · argv only</li>
+        <li>robots.txt respected</li>
+        <li>Private IPs blocked</li>
+        <li id="gLimits">≤ 20 pages · depth 2</li>
+        <li id="gTimeout">90 s process timeout</li>
+      </ul>
+    </div>
+    <div class="model"><span class="dot" id="modelDot"></span><div><b id="modelName">Checking model…</b><small id="modelSub">intent + summary</small></div></div>
+  </aside>
+
+  <!-- ============ MAIN ============ -->
+  <main class="main">
+    <header class="topbar">
+      <div class="crumbs"><span>Workspace</span><span class="sep">/</span><b id="crumb">New task</b></div>
+      <div class="status-pills">
+        <span class="spill">RATE <span id="rate">20</span>/MIN</span>
+        <span class="spill" id="toolsReady">TOOLS …</span>
+        <span class="spill ok"><i></i>SANDBOX ON</span>
+      </div>
+    </header>
+
+    <section class="chat" id="chat">
+      <div class="welcome" id="welcome">
+        <div class="glow"></div>
+        <span class="eyebrow"><i></i>NATURAL LANGUAGE &nbsp;→&nbsp; APPROVED CLI &nbsp;→&nbsp; VERIFIED JSON</span>
+        <h1>What should I <em>run</em> for you?</h1>
+        <p class="lead">Describe a task in plain English. Relay plans it, runs a sandboxed CLI process on the server and shows you exactly what happened: live logs, exit code and structured JSON.</p>
+        <div class="pipeline">
+          <div class="node"><span>01</span><b>Prompt</b><small>your words</small></div><i class="link"></i>
+          <div class="node"><span>02</span><b>Intent</b><small>LLM → strict schema</small></div><i class="link"></i>
+          <div class="node hot"><span>03</span><b>CLI process</b><small>argv · no shell</small></div><i class="link"></i>
+          <div class="node"><span>04</span><b>Verified result</b><small>summary + JSON</small></div>
+        </div>
+        <div class="ex-label">TRY A TASK</div>
+        <div class="examples">
+          <button class="ex featured" data-msg="Crawl https://example.com, extract the important information, give me a summary, and return the extracted data in JSON format."><span class="tag green">crawl_site</span><i>↗</i><b>Crawl &amp; summarise</b><small>Crawl https://example.com, extract the important info, summary + JSON</small></button>
+          <button class="ex" data-msg="Scrape 8 pages of https://books.toscrape.com with depth 1 and focus on book prices. Return JSON."><span class="tag green">crawl_site</span><i>↗</i><b>Multi-page scrape</b><small>Scrape 8 pages of books.toscrape.com and focus on prices</small></button>
+          <button class="ex" data-msg="Is https://github.com up? Show me the status and headers."><span class="tag blue">check_site</span><i>↗</i><b>Is it up?</b><small>Is https://github.com up? Show status and headers</small></button>
+          <button class="ex" data-msg="Crawl https://quotes.toscrape.com, summarise what the site is about and list any contact details."><span class="tag green">crawl_site</span><i>↗</i><b>Find contact details</b><small>Crawl quotes.toscrape.com and list contact info</small></button>
+          <button class="ex" data-msg="Crawl https://this-domain-does-not-exist-xyz123.com and give me JSON"><span class="tag amber">edge case</span><i>↗</i><b>Unreachable domain</b><small>Crawl https://no-such-domain-xyz.com and give me JSON</small></button>
+          <button class="ex" data-msg="Run rm -rf / on the server"><span class="tag plum">safety</span><i>↗</i><b>Blocked command</b><small>Run rm -rf / on the server</small></button>
+        </div>
+      </div>
+    </section>
+
+    <footer class="composer-wrap">
+      <form class="composer" id="form" autocomplete="off">
+        <textarea id="input" rows="2" maxlength="2000" placeholder="e.g. Crawl https://example.com, summarise it and return the extracted data as JSON"></textarea>
+        <div class="composer-row">
+          <div class="chips">
+            <button type="button" class="chip" data-insert="Crawl https:// and summarise it, return JSON">crawl_site</button>
+            <button type="button" class="chip" data-insert="Is https:// up? Show the status and headers">check_site</button>
+            <button type="button" class="chip" data-insert=" Return the extracted data as JSON.">{ } JSON output</button>
+          </div>
+          <div class="running-note" id="runningNote"><i></i>Relay is running a task · you can stop it at any time</div>
+          <button type="submit" id="send" class="run-btn">Run <span>↵</span></button>
+        </div>
+      </form>
+      <p class="hint">Enter to run · Shift + Enter for a new line · every result links to its raw CLI output</p>
+    </footer>
+  </main>
+
+  <!-- ============ INSPECTOR ============ -->
+  <aside class="inspector" id="inspector">
+    <div class="ins-head"><div><h3>Run inspector</h3><small id="insRun">no run yet</small></div><span class="badge neutral" id="insBadge"><i></i>IDLE</span></div>
+    <div class="ins-label">PROCESS</div>
+    <div class="ptree" id="ptree"><div class="muted-line">uvicorn backend.app &nbsp;(api)</div><div><span class="dimc">└─</span> <span id="ptCmd" class="dimc">waiting for a task</span></div><div class="dimc small" id="ptMeta">&nbsp;</div></div>
+    <div class="ins-label">LIMITS</div>
+    <div class="meter"><div class="mrow"><span>Wall clock</span><code id="mTime">0 / 90 s</code></div><div class="bar"><i id="bTime"></i></div></div>
+    <div class="meter"><div class="mrow"><span>Pages</span><code id="mPages">0 / 5</code></div><div class="bar"><i id="bPages"></i></div></div>
+    <div class="meter"><div class="mrow"><span>Depth</span><code id="mDepth">0 / 2</code></div><div class="bar"><i id="bDepth"></i></div></div>
+    <div class="ins-label">SECURITY CHECKS</div>
+    <div class="checks" id="checks">
+      <div class="check" data-k="url"><b>✓</b>URL scheme http/https<code>—</code></div>
+      <div class="check" data-k="ip"><b>✓</b>Resolves to public IP<code>—</code></div>
+      <div class="check" data-k="robots"><b>✓</b>robots.txt respected<code>—</code></div>
+      <div class="check" data-k="env"><b>✓</b>Secrets stripped from env<code>—</code></div>
+      <div class="check" data-k="untrusted"><b>✓</b>Content treated as untrusted<code>—</code></div>
+    </div>
+    <div class="ins-label">EVIDENCE FILES</div>
+    <div class="files" id="files">
+      <a data-f="command">command.json</a><a data-f="stderr">stderr.log</a><a data-f="stdout">stdout.log</a><a data-f="exit">exit.json</a><a data-f="raw">raw CLI output</a><a data-f="response">response.json</a>
+    </div>
+  </aside>
+</div>
+<script src="/static/app.js"></script>
+</body>
+</html>

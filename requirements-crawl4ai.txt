@@ -1,0 +1,3 @@
+# Optional: enables the Crawl4AI CLI (`crwl`) as the primary crawler.
+# After installing run:  crawl4ai-setup   (downloads headless Chromium via Playwright)
+crawl4ai>=0.6
