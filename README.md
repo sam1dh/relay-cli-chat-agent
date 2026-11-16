@@ -1,18 +1,31 @@
----
-title: Relay CLI Chat Agent
-emoji: 🕷️
-colorFrom: red
-colorTo: yellow
-sdk: docker
-app_port: 7860
-pinned: false
----
+# Relay: a chat that doesn't just talk, it runs real CLI tasks
 
-# Relay: a CLI-driven AI chat that runs real tasks
-
-**Relay** is a chat app that understands natural-language requests and **runs real CLI processes on the backend** to do the work. The main demo is website crawling. You give it a URL, Gemini works out the task, and the backend runs the **Crawl4AI CLI (`crwl`)** in headless Chromium. If Crawl4AI is unavailable, our own **`sitecrawl`** CLI takes over. The backend captures **stdout, stderr, the exit code and the JSON output file**, checks the result, and the chat shows a **streamed summary plus structured JSON**. You can watch the command, the process ID and the live log while it runs.
+**Relay** is an AI chat application that understands a natural-language request, **runs an approved command-line tool on the backend**, captures exactly what happened (**stdout, stderr, exit code, output file**), verifies the result, and returns a **summary plus structured JSON** in the chat.
 
 > BuildSprint Round 2: *CLI-Driven AI Chat Execution for Complex Tasks*
+
+| | |
+|---|---|
+| 🎥 **Demo video** | https://www.youtube.com/watch?v=lT7gVd8AzAU |
+| 🌐 **Live demo** | https://relay-cli-chat-agent.onrender.com *(free tier, so it may take ~50 s to wake up)* |
+| 💻 **Run locally** | `docker run -p 8000:7860 --env-file .env --shm-size=1g relay` (see [Run locally](#5-run-locally)) |
+
+![Relay: chat UI with plan, live CLI execution, result and run inspector](docs/images/app-overview.png)
+
+---
+
+## Contents
+1. [What it does](#1-what-it-does)
+2. [Architecture](#2-architecture)
+3. [How a request flows, step by step](#3-how-a-request-flows-step-by-step)
+4. [Screenshots](#4-screenshots)
+5. [Run locally](#5-run-locally)
+6. [Deploy](#6-deploy)
+7. [Security](#7-security-and-responsible-execution)
+8. [Response JSON](#8-response-json)
+9. [Tests](#9-tests)
+10. [Tech stack and AI disclosure](#10-tech-stack-and-ai-disclosure)
+11. [Design notes and limitations](#11-design-notes-and-limitations)
 
 ---
 
@@ -20,219 +33,280 @@ pinned: false
 
 | You type | What actually happens |
 |---|---|
-| "Crawl https://example.com, extract the important information, give me a summary, and return JSON" | Gemini maps the request to `crawl_site` and the URL is validated. The backend spawns `crwl https://example.com -o all -O runs/<id>/crawl4ai.json --bypass-cache` (or `python cli/sitecrawl.py …`) and streams its output live. It then checks the exit code, validates and normalises the JSON, streams a summary, and returns the structured JSON |
-| "Scrape 8 pages of https://books.toscrape.com and focus on prices" | Same flow as a multi-page crawl (`--deep-crawl bfs --max-pages 8`), with a *focus* section in the summary |
-| "Is https://github.com up? Show headers" | Runs `curl -sS -I --max-time 15 --proto =http,https -- <url>` and parses the status line and headers into JSON |
-| "Run rm -rf / on the server" | **Refused.** There is no shell tool, and only approved tools can run |
-| "Crawl ftp://files.example.com" or a domain that doesn't exist | **Rejected before any process starts**, with an honest reason |
+| *Crawl https://example.com, extract the important information, give me a summary, and return JSON* | The LLM turns the message into a JSON plan, the backend runs **`crwl https://example.com -o all …`** (Crawl4AI), streams its live output, checks the exit code and output file, and returns a summary plus valid JSON |
+| *Scrape 8 pages of https://books.toscrape.com and focus on book prices* | A multi-page crawl. Code extracts **book names and prices**, computes lowest/highest/average, and shows an **items table built from CLI output, not by the AI** |
+| *how many products are there?* | A follow-up with no URL: it reuses the site from the conversation and answers from the page |
+| *Is https://github.com up?* | Runs **`curl -sS -I …`** (HEAD request) and shows the HTTP status, server and response time |
+| *Run rm -rf / on the server* | **Refused.** There is no shell tool, and only approved tools can run |
+| *Crawl https://no-such-domain.xyz* | **Rejected before any process starts**, with an honest error |
+
+---
 
 ## 2. Architecture
 
+![Architecture: chat, backend, CLI processes and evidence](docs/images/architecture.png)
+
 ```mermaid
 flowchart LR
-    U[Chat UI<br/>frontend/] -- POST /api/chat · SSE stream --> API[FastAPI<br/>backend/app.py]
-    API --> O[Orchestrator<br/>orchestrator.py]
-    O --> I[AI layer: Gemini<br/>intent.py → strict JSON schema<br/>rule-based fallback]
-    I --> V[Validators<br/>validators.py<br/>URL · SSRF · limits]
-    O --> R[Approved tool registry<br/>tools.py]
-    R --> E[Process executor<br/>executor.py<br/>Popen argv · no shell · process group]
-    E -- spawns --> C4[[Crawl4AI CLI<br/>crwl + headless Chromium]]
-    E -- fallback --> SC[[sitecrawl CLI<br/>cli/sitecrawl.py]]
-    E -- spawns --> CU[[curl]]
-    C4 -- JSON file + logs --> E
-    SC -- JSON file + stderr JSON lines --> E
-    E -- stdout · stderr · exit code --> O
-    O --> AD[crawl4ai_adapter.py<br/>normalise + validate]
-    O --> S[Summarizer: Gemini streaming<br/>untrusted-content wrapper<br/>extractive fallback]
-    O -- live events: plan · logs · exit · summary deltas · final JSON --> U
-    E -. evidence .-> RUNS[(runs/&lt;run_id&gt;/ command · stdout · stderr · exit · output · response)]
+    U[Chat UI] -- POST /api/chat --> API[FastAPI backend]
+    API --> O[Orchestrator]
+    O --> I[Intent: LLM → JSON plan<br/>regex fallback]
+    I --> V[Validators: URL · DNS · SSRF · limits]
+    V --> R[Tool registry: approved CLIs<br/>builds argument list]
+    R --> E[Executor: subprocess.Popen<br/>shell=False · timeout · Stop]
+    E --> C1[[crwl · Crawl4AI<br/>headless Chromium]]
+    E --> C2[[sitecrawl<br/>requests + BeautifulSoup]]
+    E --> C3[[curl<br/>HEAD request]]
+    C1 & C2 & C3 -- stdout · stderr · exit code · JSON file --> E
+    E --> A[Adapter + Structure:<br/>verify · normalise · extract]
+    A --> S[Summarizer: LLM answer<br/>from verified facts]
+    S -- SSE stream --> U
+    E -. saves .-> EV[(Evidence: runs/&lt;run_id&gt;/)]
 ```
 
-How this maps to the brief's pseudocode:
+**The architecture in one line:** the **AI understands** the request, a **real CLI process does the work**, and **code verifies** the result before the answer is streamed to the user.
+
+---
+
+## 3. How a request flows, step by step
+
+Example request: *"Scrape 8 pages of books.toscrape.com and focus on prices"*
+
+### Step 1: Chat UI
+The user types the request. The browser sends it to the **FastAPI** backend and keeps the connection open, so every update streams back live through **Server-Sent Events (SSE)**: the plan, the command, each log line, the exit code, the summary and the final JSON.
+
+### Step 2: Orchestrator
+The controller. Every request follows the same fixed steps: **understand → check → run → verify → respond**.
+
+### Step 3: Understanding the request (Intent)
+The backend sends the message to the **LLM API** (Groq · `openai/gpt-oss-120b`; Gemini is also supported) and asks it to reply **only in JSON**:
+```json
+{ "intent": "crawl_site", "url": "https://books.toscrape.com", "max_pages": 8, "max_depth": 1, "focus": "prices" }
+```
+| Field | Meaning |
+|---|---|
+| `intent` | what the user wants: `crawl_site`, `check_site`, `chat`, or `unsupported` |
+| `url` | the website mentioned |
+| `max_pages` | how many pages to crawl |
+| `max_depth` | how deep to follow links from the first page |
+| `focus` | what the user cares about (prices, contacts…) |
+
+**Rules:** the intent must be one of the 4 allowed values. The LLM **never writes a command**. It must not invent a URL (if none is given, the app asks for one). Requests to run commands, access files or hack are marked `unsupported` and refused. Pages are limited to 1–20 and depth to 0–2; larger values are reduced to the maximum. If the LLM is not available, **regex and keywords** read the same values from the message and build the same JSON.
+
+### Step 4: Validators
+Before anything runs, the URL must be **http/https** with no embedded credentials, the domain must **resolve in DNS**, and every resolved IP must be **public**. Private, loopback, link-local and the cloud metadata address `169.254.169.254` are blocked (**SSRF protection**). NAT64 and IPv4-mapped IPv6 addresses are decoded to the IPv4 address inside. If anything fails, **no process is started**.
+
+### Step 5: Tool registry (the approved CLI tools)
+Only three tools can ever run. For each one, the registry builds the command as a **list of separate arguments** from the validated JSON:
+
+| Tool | Used for | Argument list (example) |
+|---|---|---|
+| **Crawl4AI** (`crwl`), primary | crawling websites, including JavaScript sites | `["crwl", URL, "-o", "all", "-O", "runs/<id>/crawl4ai.json", "--bypass-cache", "--deep-crawl", "bfs", "--max-pages", "8"]` |
+| **sitecrawl**, fallback | lightweight crawling | `["python", "-u", "cli/sitecrawl.py", "--url", URL, "--max-pages", "8", "--max-depth", "1", "--timeout", "10", "--delay", "0.2", "--concurrency", "3", "--output", "runs/<id>/result.json"]` |
+| **curl** | "is this site up?" checks | `["curl", "-sS", "-I", "--max-time", "15", "--connect-timeout", "8", "--proto", "=http,https", "-A", "...", "-w", "<status/time/ip>", "--", URL]` |
+
+Each value sits in **its own slot**, so text from the user can never turn into an extra command.
+
+**Why two crawlers?**
+- **sitecrawl** uses Python **requests** to download the raw HTML and **BeautifulSoup** to parse it. It's fast and light, but it only sees the HTML the server sends, so pages built with JavaScript look almost empty.
+- **Crawl4AI** opens the page in a **real headless Chrome** (Playwright), runs the JavaScript, waits for content, and converts the page to clean markdown for the LLM.
+- Crawl4AI is heavier, so it runs **first**, and **sitecrawl takes over automatically** if Crawl4AI fails, returns bad output or times out. Both attempts are recorded in `execution.attempts`.
+
+**curl flags:** `-I` sends a HEAD request (headers only, very fast), `--proto =http,https` allows only web protocols, `--max-time 15` caps the time, `-w` prints the status code, timing and IP, and `--` stops the URL being read as an option. Redirects are **not** followed, so curl can't be bounced to an internal host.
+
+### Step 6: Executor, `subprocess.Popen` without a shell
+The executor runs the argument list with Python's **`subprocess.Popen`**, which starts an operating-system command (like `crwl` or `curl`) as a **separate process** and keeps control of it while it runs.
 
 ```python
-task    = intent.parse(prompt) + validate_url(url)           # validate_user_request
-process = executor.run(TOOLS["crawl4ai"], task.params, job)   # start_approved_cli (falls back to "crawl_site")
-stdout, stderr, exit_code = <reader threads + proc.wait()>     # collect_process_output
-result  = orchestrator._load_result(spec, end)                # validate_and_parse (exit code + JSON shape)
-reply   = summary (streamed) + JSON envelope                   # format_chat_response
+subprocess.Popen(argv, shell=False, stdin=DEVNULL, stdout=PIPE, stderr=PIPE,
+                 cwd=run_folder, env=safe_env(), start_new_session=True)
 ```
 
-### Project layout
-```
-relay-cli-chat-agent/
-├── cli/sitecrawl.py          # our crawler CLI (fallback + also usable by hand)
-├── backend/
-│   ├── app.py                # FastAPI: /api/chat (SSE), /api/cancel, /api/runs, /api/health
-│   ├── orchestrator.py       # plan → crawler chain (crawl4ai → sitecrawl) → validate → respond
-│   ├── intent.py             # NL → TaskPlan (Gemini with strict schema, rule-based fallback)
-│   ├── validators.py         # URL validation, SSRF protection, clamping
-│   ├── tools.py              # APPROVED tool registry: argv builders, timeouts, exit-code meanings
-│   ├── executor.py           # subprocess runner: live capture, timeout, cancel, process-tree kill, limits
-│   ├── crawl4ai_adapter.py   # converts Crawl4AI output into our schema (defensive)
-│   ├── summarizer.py         # streaming LLM summary with untrusted-content wrapper / extractive fallback
-│   ├── llm.py                # Gemini + any OpenAI-compatible API over HTTPS (incl. streaming)
-│   └── config.py             # env-var configuration
-├── frontend/                 # index.html · app.js · style.css (no build step)
-├── tests/                    # 18 pytest tests + local fixture website + fake `crwl`
-├── Dockerfile  .dockerignore  requirements.txt  requirements-crawl4ai.txt
-├── run.bat / run.sh                      # one-command local start
-└── install-crawl4ai.bat / .sh            # optional: Crawl4AI + Chromium
+**With a shell vs without a shell:**
+```python
+# ❌ shell=True: one text string, read by bash. ";" means "run another command"
+subprocess.run(f"crwl {url}", shell=True)          # url = "x.com; rm -rf /"  → rm runs!
+
+# ✅ shell=False: a list of arguments, no shell, ";" is just a character
+subprocess.Popen(["crwl", url], shell=False)        # crwl receives one strange URL, rm never runs
 ```
 
-## 3. The CLI layer (the core of the challenge)
+While the tool runs, the executor:
+- reads **stdout and stderr live** on two reader threads, which avoids pipe deadlocks, and streams each line to the chat
+- enforces a **90-second timeout** and supports the **Stop** button. Both kill the **whole process tree** (process group / `taskkill /T`), so no orphan Chrome is left behind
+- applies **CPU-time and 64 MB file-size limits** (Linux)
+- **removes API keys** and any `*KEY*`, `*TOKEN*`, `*SECRET*` variables from the process environment
+- saves the **exit code** and output file
 
-### Which CLIs, and why
-| Tool | Binary | Why |
-|---|---|---|
-| `crawl4ai` (primary) | `crwl` | An open-source, LLM-oriented crawler with a **native CLI**. It drives **headless Chromium**, so JavaScript-rendered sites work, and it outputs clean markdown and metadata that are ideal for summarising. We call it with `-o all -O <file>` because `-o json` only prints `extracted_content`, which needs an extraction schema. |
-| `crawl_site` (fallback) | `python cli/sitecrawl.py` | Our own small crawler (requests + BeautifulSoup) with strict safety: robots.txt, an SSRF check on **every redirect**, page/depth/size/time limits, parallel fetching, **JSON-lines progress on stderr**, a JSON result file and meaningful exit codes (`0` ok, `2` invalid input, `3` unreachable, `4` blocked by robots.txt, `5` internal error). It needs nothing extra installed. |
-| `check_site` | `curl` | The standard HTTP CLI. A `HEAD` request is the cheapest uptime and headers check. |
+**Why `Popen` and not `subprocess.run`?** `run` waits until the command finishes. `Popen` returns immediately, so we can stream logs live and kill the process on a timeout or Stop.
 
-**Crawler chain:** `CRAWLER=auto` (the default) uses Crawl4AI if `crwl` is installed. If it crashes, exits non-zero or produces output that can't be parsed, the backend **automatically runs `sitecrawl`**. The UI and the JSON show both attempts, e.g. `execution.attempts: [crawl4ai (failed), crawl_site (partial)]`, so nothing is hidden.
+### Step 7: Verify and extract
+When the process ends, the adapter checks the **exit code** (0 = success) and validates the **output JSON**. If something is wrong, the real error is shown, never a fake result. If it's valid, **code** (not the LLM) extracts the facts: titles, headings, **items with prices**, counts like "1000 results", contacts, and **price statistics**.
 
-### How inputs reach the CLI
-1. Gemini can only choose a tool **name** from an allow-list (`crawl_site`, `check_site`, `chat`, `unsupported`) plus typed fields. Any extra fields it returns, such as a "command", are ignored.
-2. The URL is validated: http/https only, no credentials, no whitespace, the DNS name must resolve, and private/loopback/link-local IPs (including `169.254.169.254`) are blocked. Numbers are clamped to server limits.
-3. `tools.py` builds an **argv list** and `subprocess.Popen(argv, shell=False)` runs it. Text like `https://a.com/;rm -rf /` arrives as one literal argument (there's a test for this).
+### Step 8: Summarize and stream the answer
+The LLM writes a short answer **using only the extracted facts**. Website text is wrapped in `<untrusted_website_content>` tags, so a page can't instruct the AI, and the LLM's output is **display-only**: it can never trigger a tool. The answer streams to the chat word by word, followed by the stat tiles, the items table and the JSON.
 
-### How output is captured
-* stdout and stderr are each read line by line on their own reader threads, **streamed live** to the browser over Server-Sent Events, and saved in full to `runs/<run_id>/stdout.log` and `stderr.log`.
-* The exit code is mapped to a meaning. `command.json`, `exit.json`, the raw output (`result.json` or `crawl4ai.json`) and the final `response.json` are saved as evidence and can be opened from the chat and from the Run inspector.
+### Step 9: Evidence
+Every run is saved in `runs/<run_id>/`: `command.json`, `stdout.log`, `stderr.log`, `exit.json`, the raw CLI output, and `response.json`. Each file opens from the chat, so **every answer can be traced back to the real execution**.
 
-### Long-running tasks, timeouts, cancellation, failures
-* **Process timeout** (`PROCESS_TIMEOUT_S`, default 90 s). The **whole process tree is killed** (POSIX process group, or `taskkill /T` on Windows), so headless Chromium can't be left running.
-* **■ Stop** calls `POST /api/cancel/<run_id>`, which also kills the process tree.
-* On Linux/Docker, the child process gets **CPU-time and file-size limits** (`RLIMIT_CPU`, `RLIMIT_FSIZE`).
-* Inside the CLIs: a 10 s timeout per request, at most 5 redirects, 2 MB per page, and caps of 20 pages / depth 2.
-* At most 3 tasks run at once, and requests are limited to 20 per minute per IP.
-* **Failure honesty:** if the exit code isn't 0, the JSON is invalid, or no page was crawled, the response is marked `failed` / `blocked` / `invalid_input` / `timeout` / `cancelled` and **no data is shown as if it were real**. Partial crawls are labelled `partial`, with the failed URLs listed.
+---
 
-## 4. Security and responsible execution
-| Risk | Mitigation |
-|---|---|
-| Shell injection | No shell: argv lists, `shell=False`, approved tools only, and the model never writes commands |
-| SSRF / internal network | DNS-resolved IPs are checked before any process starts. `sitecrawl` re-checks every redirect hop. Private, reserved and metadata ranges are blocked |
-| Prompt injection from websites | Page text is wrapped in `<untrusted_website_content>` and the model is told to treat it as data. Its output is display text only and can never trigger a tool. Instruction-like text is **detected and flagged** in the UI |
-| Secrets | Keys come only from `.env` or the host's secret store and are sent only in provider request headers. **Every `*KEY*`, `*TOKEN*`, `*SECRET*` variable is removed from the child process environment.** Errors contain no tracebacks, and cookies are never echoed |
-| XSS from crawled content | All website-derived text is HTML-escaped in the UI |
-| Least privilege | The Docker image runs as a non-root user. Child processes get stdin closed, their own working directory, and resource limits |
-| Respecting sites | robots.txt is honoured (`sitecrawl` itself; a pre-flight check before Crawl4AI), with an identifiable User-Agent and a politeness delay |
+## 4. Screenshots
 
-Known limitation: links that Crawl4AI follows inside a deep crawl aren't re-checked against private IPs by us. Only the start URL is. `sitecrawl` checks every hop. In production, run the container on an egress-restricted network.
+**Plan + live CLI execution (sitecrawl on the deployed app)**: the exact command, PID, timeout, `shell=False`, the live log and the exit code.
+
+![Live CLI execution](docs/images/live-cli-execution.png)
+
+**Crawl4AI run**: `crwl … --deep-crawl bfs` with Crawl4AI's own `[FETCH]/[SCRAPE]/[COMPLETE]` logs, then the verified result.
+
+![Crawl4AI run](docs/images/crawl4ai-run.png)
+
+**Result with highlights**: stat tiles, plus text quoted verbatim from the CLI output (not generated by the LLM).
+
+![Result highlights](docs/images/result-highlights.png)
+
+**Cancellation**: pressing ■ Stop kills the Crawl4AI process tree (exit code -9). The status is **CANCELLED**, and no result is claimed.
+
+![Crawl4AI cancelled](docs/images/crawl4ai-cancelled.png)
+
+**Understood request + execution**: the LLM's plan (intent, URL, limits) followed by the sitecrawl command.
+
+![Plan and execution](docs/images/plan-and-execution.png)
+
+---
 
 ## 5. Run locally
 
-**Prerequisites:** Python 3.10+ and `curl` (built into Windows 10+, macOS and Linux). A Gemini key is optional but recommended (free at https://aistudio.google.com/apikey).
+**Prerequisites:** Docker, or Python 3.10+ and `curl`. You also need an LLM key: Groq is free at https://console.groq.com/keys (Gemini also works). The app works without a key in rule-based mode.
 
-```bash
-# 1. unzip / clone, then from the project folder:
-run.bat            # Windows  (creates .venv, installs deps, copies .env.example → .env, starts server)
-./run.sh           # macOS / Linux
-
-# 2. open http://localhost:8000
+### Create `.env`
+```env
+LLM_PROVIDER=openai
+OPENAI_API_KEY=gsk_your_key_here
+OPENAI_BASE_URL=https://api.groq.com/openai/v1
+OPENAI_MODEL=openai/gpt-oss-120b
+LLM_REASONING_EFFORT=low
+CRAWLER=auto
 ```
 
-Then add your key: open `.env`, set `GEMINI_API_KEY=...`, and restart. Without a key, everything still works using the rule-based intent parser and extractive summaries.
-
-**Optional: enable Crawl4AI** (headless Chromium, about 300 MB download, run once):
-```bash
-install-crawl4ai.bat      # Windows
-./install-crawl4ai.sh     # macOS / Linux
-```
-On **Arch Linux** the script installs Chromium's libraries with `pacman` instead of `apt` (Playwright's `--with-deps` only supports apt). Restart the app. The sidebar will show **crawl4ai (crwl)** with a green dot. If it isn't installed, the app uses `sitecrawl` automatically and says so.
-
-**Manual setup** (instead of the scripts):
-```bash
-python -m venv .venv
-.venv\Scripts\activate            # Windows   |   source .venv/bin/activate  (macOS/Linux)
-pip install -r requirements.txt
-copy .env.example .env            # Windows   |   cp .env.example .env
-python -m uvicorn backend.app:app --port 8000
-```
-
-**Run the crawler CLI by hand:**
-```bash
-python cli/sitecrawl.py --url https://example.com --max-pages 3 --output out.json
-crwl https://example.com -o markdown          # if Crawl4AI is installed
-```
-
-**Tests:** `pytest -q`. There are 18 tests and no internet is needed. They cover validation, intent parsing, argv safety, secret stripping, the CLI directly, end-to-end crawls, the curl check, unreachable hosts, a real **timeout kill**, real **cancellation**, the LLM path (mocked), streaming summaries, and Crawl4AI success, crash fallback and broken-output fallback (using a fake `crwl`).
-
-### Environment variables (`.env`)
-| Variable | Default | Meaning |
-|---|---|---|
-| `LLM_PROVIDER` | `auto` | `gemini`, `openai` (any OpenAI-compatible API: OpenAI, Groq, OpenRouter, Ollama), `none`, or `auto` |
-| `GEMINI_API_KEY` / `GEMINI_MODEL` | – / `gemini-2.5-flash` | Gemini settings |
-| `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_MODEL` | – | OpenAI-compatible settings. **Groq:** `https://api.groq.com/openai/v1` with `openai/gpt-oss-120b` (or `openai/gpt-oss-20b`) |
-| `LLM_REASONING_EFFORT` | – | `low` / `medium` / `high` for reasoning models such as Groq GPT-OSS (`low` = fastest) |
-| `CRAWLER` | `auto` | `auto` (Crawl4AI if installed, otherwise sitecrawl), `crawl4ai`, or `sitecrawl` |
-| `CRAWL4AI_FALLBACK` | `1` | Fall back to sitecrawl if Crawl4AI fails |
-| `INTENT_FAST_PATH` | `0` | Set to `1` to skip the intent LLM call for unambiguous requests (about 1 s faster) |
-| `CRAWL_MAX_PAGES` / `CRAWL_MAX_DEPTH` | 20 / 2 | Hard caps |
-| `PROCESS_TIMEOUT_S` | 90 | CLI wall-clock limit |
-| `MAX_CONCURRENT_JOBS` | 3 | Parallel CLI processes |
-| `ALLOW_PRIVATE_HOSTS` | 0 | **Local testing only** (lets you crawl 127.0.0.1) |
-
-### How to test the demo
-1. Click **Crawl & summarise**. Watch the plan and step tracker, the exact command with its PID, the live log, the exit code, the streamed summary, the stat tiles, and the JSON tab.
-2. Open **Raw CLI output** and the Run inspector's evidence files to see the run's evidence.
-3. Try **Multi-page scrape**, then press **■ Stop** midway to see cancellation.
-4. Try **Unreachable domain** and **Blocked command** for the error and safety states.
-
-## 6. Deploy (Docker)
-
-The `Dockerfile` builds one container with Python 3.12, the app, **Crawl4AI and headless Chromium**, `sitecrawl` and `curl`. It runs as a non-root user on port 7860 (or `$PORT`).
-
-### Option A: Hugging Face Spaces (free, no card, 16 GB RAM, recommended)
-1. On huggingface.co, go to **New Space**, name it `relay`, and set **SDK: Docker** (blank) and **CPU basic (free)**.
-2. Upload the project (**Files → Upload files**, without `.env`) or push with git:
-   ```bash
-   git remote add space https://huggingface.co/spaces/<username>/relay
-   git push space main      # password = a Hugging Face access token
-   ```
-3. Go to **Settings → Variables and secrets → New secret** and add `GEMINI_API_KEY`.
-4. The build takes about 8–12 min (Chromium is large). The app will be at `https://<username>-relay.hf.space`.
-
-The README front-matter (`sdk: docker`, `app_port: 7860`) tells Hugging Face how to run it.
-
-### Option B: Render.com (free, from GitHub)
-Go to **New → Web Service**, pick the repo, and set **Runtime: Docker**. Add `GEMINI_API_KEY`. The free tier has 512 MB, which is too small for Chromium, so under **Docker build args** set `WITH_CRAWL4AI=0` (the app then uses sitecrawl). The free tier sleeps when idle, so the first request takes about 50 s.
-
-### Local container
+### Option A: Docker (recommended, includes Crawl4AI + Chromium)
 ```bash
 docker build -t relay .
-docker run -p 7860:7860 -e GEMINI_API_KEY=your_key relay    # open http://localhost:7860
+docker run --rm -p 8000:7860 --env-file .env --shm-size=1g -v "$PWD/runs:/tmp/runs" --name relay relay
+# open http://localhost:8000
+```
+`--shm-size=1g` is needed by Chromium. To stop it: `docker stop relay`.
+
+### Option B: Python
+```bash
+./run.sh          # macOS / Linux
+run.bat           # Windows
+# open http://localhost:8000
+```
+Optional, to add Crawl4AI with headless Chromium: `./install-crawl4ai.sh` (Arch is supported via pacman) or `install-crawl4ai.bat`. Without it, the app uses sitecrawl and says so.
+
+### Use the crawler CLI by hand
+```bash
+python cli/sitecrawl.py --url https://example.com --max-pages 3 --output out.json
+docker exec -it relay crwl https://example.com -o markdown
 ```
 
-## 7. Response JSON shape
+### Environment variables
+| Variable | Default | Meaning |
+|---|---|---|
+| `LLM_PROVIDER` | `auto` | `openai` (any OpenAI-compatible API, e.g. Groq), `gemini`, or `none` |
+| `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_MODEL` | – | for Groq: `https://api.groq.com/openai/v1` with `openai/gpt-oss-120b` |
+| `GEMINI_API_KEY` / `GEMINI_MODEL` | – / `gemini-2.5-flash` | alternative provider |
+| `LLM_REASONING_EFFORT` | – | `low` / `medium` / `high` for reasoning models (`low` is fastest) |
+| `CRAWLER` | `auto` | `auto` (Crawl4AI if installed, else sitecrawl), `crawl4ai`, or `sitecrawl` |
+| `CRAWL4AI_FALLBACK` | `1` | fall back to sitecrawl if Crawl4AI fails |
+| `CRAWL_MAX_PAGES` / `CRAWL_MAX_DEPTH` | `20` / `2` | hard limits |
+| `PROCESS_TIMEOUT_S` | `90` | CLI wall-clock limit |
+| `MAX_CONCURRENT_JOBS` | `3` | parallel CLI processes |
+| `ALLOW_PRIVATE_HOSTS` | `0` | **local testing only**; keep at 0 |
+
+---
+
+## 6. Deploy
+
+The live demo runs on **Render** (free web service, Docker).
+
+1. Render → **New → Web Service** → connect this repo → Runtime **Docker** → Instance **Free**.
+2. Add the environment variables from `.env` above, plus `CRAWLER=sitecrawl` and `WITH_CRAWL4AI=0`.
+3. Deploy. Render sets `$PORT`, and the Dockerfile reads it.
+
+> **Note:** the free tier has **512 MB RAM**, which isn't enough for Crawl4AI's headless Chrome (~2 GB recommended). So **the live demo uses the `sitecrawl` CLI**, and the sidebar honestly shows *"crawl4ai · not installed · fallback active"*. The full Docker image (local or on a ≥2 GB host) runs **Crawl4AI as the primary crawler**, as shown in the demo video.
+
+---
+
+## 7. Security and responsible execution
+
+| Requirement | How Relay does it |
+|---|---|
+| No raw text in a shell | `subprocess.Popen(argv, shell=False)`: user and LLM text is only ever one argument value |
+| Approved tools, validated inputs | allow-list of 3 CLIs · URL scheme, credentials, DNS checks · the server builds every file path |
+| Least privilege / sandboxing | Docker non-root user · own process group · stdin closed · CPU and file-size limits |
+| Timeouts and limits | 90 s per process · 10 s per request · ≤ 20 pages · depth ≤ 2 · 2 MB per page · 3 jobs · 20 req/min per IP |
+| SSRF / internal network | private, loopback, link-local and metadata IPs blocked · NAT64 decoded · re-checked on every redirect (sitecrawl) |
+| robots.txt | pre-checked before Crawl4AI · enforced by sitecrawl |
+| Website content is untrusted | `<untrusted_website_content>` wrapper · LLM output is display-only · injection text flagged · HTML escaped in the UI |
+| No secrets exposed | keys only in `.env` / the host's secret store · stripped from child processes · never in logs, chat or tracebacks |
+| Honest status | `success` · `partial` · `failed` · `timeout` · `cancelled` · `blocked` · `invalid_input`: never claims success without evidence |
+
+---
+
+## 8. Response JSON
 ```json
 {
-  "status": "success | partial | failed | timeout | cancelled | blocked | invalid_input",
-  "request":   { "message": "...", "intent": "crawl_site", "url": "...", "parameters": {"max_pages": 5, "max_depth": 1, "focus": null}, "interpreted_by": "Gemini (gemini-2.5-flash)" },
-  "execution": { "run_id": "...", "tool": "crawl4ai", "command": ["crwl", "https://example.com", "-o", "all", "..."], "exit_code": 0, "exit_meaning": "success", "duration_ms": 2140, "timed_out": false, "cancelled": false,
-                 "attempts": [{"tool": "crawl4ai", "exit_code": 0, "outcome": "success"}] },
-  "summary":   { "text": "...", "key_points": ["..."], "site_type": "reference", "focus_findings": null, "suspicious_content_detected": false, "generated_by": "llm" },
-  "data":      { "crawler": "crawl4ai", "site": {"name": "...", "description": "...", "emails": [], "phones": [], "social_links": []},
-                 "stats": {"pages_crawled": 1, "pages_failed": 0, "total_words": 28}, "pages": [ ... ], "errors": [] },
+  "status": "success",
+  "request":   { "message": "...", "intent": "crawl_site", "url": "https://books.toscrape.com",
+                 "parameters": { "max_pages": 8, "max_depth": 1, "focus": "prices" },
+                 "interpreted_by": "OpenAI-compatible (openai/gpt-oss-120b)" },
+  "execution": { "run_id": "...", "tool": "crawl4ai", "command": ["crwl", "https://books.toscrape.com", "-o", "all", "..."],
+                 "exit_code": 0, "exit_meaning": "success", "duration_ms": 10500, "timed_out": false, "cancelled": false,
+                 "attempts": [{ "tool": "crawl4ai", "exit_code": 0, "outcome": "success" }] },
+  "summary":   { "text": "...", "key_points": ["..."], "site_type": "e-commerce", "focus_findings": "...", "generated_by": "llm" },
+  "data":      { "site": { "name": "...", "emails": [], "phones": [] },
+                 "stats": { "pages_crawled": 5, "pages_failed": 0, "total_words": 2479 },
+                 "extracted_items": [{ "name": "Tipping the Velvet", "price": "£53.74", "price_value": 53.74, "details": "In stock", "page": "..." }],
+                 "price_stats": { "items_with_price": 20, "min": 10.0, "max": 59.99, "average": 34.5 },
+                 "pages": ["..."], "errors": [] },
   "error": null
 }
 ```
 
-## 8. Design notes: how this evolved from the Round 1 proposal
-The architecture is the one we proposed: Gemini AI layer, then orchestration, then process executor, then the Crawl4AI CLI, then structured output, packaged in Docker. Two implementation choices changed:
-* **Python + FastAPI instead of Node.js + Express.** Crawl4AI, our fallback crawler and the backend now share one language and one dependency set, which made the process control code (process groups, resource limits, reader threads) simpler. The framework is under 1% of response time, so the bottlenecks are the crawl and the LLM, and both are streamed.
-* **Plain HTML/JS instead of React.** There's no build step, so the judges can run it with one command. It's still a streaming chat UI with a run inspector, JSON export and a pages table.
-* **Added a fallback crawler** (`sitecrawl`) so the demo never depends on a headless browser being installed.
+---
 
-## 9. Tech stack and AI disclosure
-* **Backend:** Python 3, FastAPI, Uvicorn, Server-Sent Events, `subprocess`
-* **CLI tools:** Crawl4AI (`crwl`, Playwright/Chromium), `sitecrawl` (requests + BeautifulSoup4), `curl`
-* **Frontend:** HTML/CSS/JavaScript. Fonts: Bricolage Grotesque, IBM Plex Sans/Mono, Instrument Serif. UI designed in Penpot.
-* **LLM at runtime:** Google Gemini for intent parsing and the streamed summary (any OpenAI-compatible model also works). A rule-based / extractive fallback is built in.
-* **AI assistance during development:** Claude (Anthropic) was used as a coding and design assistant for parts of the code, tests, docs and the Penpot UI design. I reviewed, ran and tested the implementation and can explain every component.
+## 9. Tests
+```bash
+docker run --rm relay python -m pytest -q -p no:cacheprovider
+```
+25+ offline tests (a local fixture website plus a fake `crwl` binary) covering:
+- **argv safety** and **secret stripping** from the child environment
+- **SSRF blocking**, including NAT64 / IPv4-mapped addresses
+- a **real timeout kill** and **real cancellation**
+- the Crawl4AI **crash, bad-output and timeout fallback** to sitecrawl
+- **listing extraction** (items and prices), with **no fake phone numbers** from year ranges
+- **follow-up context** and the **LLM path** (mocked, including a model trying to inject a command)
 
-## 10. Limitations and next steps
-* Re-check every link Crawl4AI follows against the SSRF guard (for example via a filtering proxy).
-* More approved tools (PDF text extraction, sitemap parsing, Lighthouse audits), each with its own validated argv builder.
-* Stronger isolation: run CLIs in a separate container or gVisor sandbox with egress filtering.
+---
+
+## 10. Tech stack and AI disclosure
+- **Backend:** Python 3.12 · FastAPI · Uvicorn · Server-Sent Events · `subprocess`
+- **CLI tools:** Crawl4AI (`crwl`, Playwright headless Chromium) · `sitecrawl` (requests + BeautifulSoup4) · `curl`
+- **Frontend:** HTML / CSS / JavaScript (no build step) · UI designed in **Penpot**
+- **LLM at runtime:** Groq `openai/gpt-oss-120b` (or Google Gemini) for intent parsing and streamed summaries, with a regex fallback
+- **Deployment:** Docker (non-root) · Render
+- **AI assistance:** **Claude (Anthropic)** was used as a coding and design assistant. I reviewed, ran and tested the implementation and can explain every component.
+
+---
+
+## 11. Design notes and limitations
+**Changes from the Round 1 proposal:** the architecture is the one proposed (Gemini/LLM layer → orchestration → process executor → Crawl4AI CLI → structured output → Docker). Two implementation choices changed:
+- **Python + FastAPI instead of Node.js + Express:** Crawl4AI, the fallback crawler and the backend share one language, which keeps process control simple. Framework overhead is under 1% of response time.
+- **Plain HTML/JS instead of React:** no build step, so the app runs with one command.
+
+**Limitations and next steps:**
+- Links that Crawl4AI follows inside a deep crawl aren't re-checked against private IPs by us (the start URL is). Run on an egress-restricted network in production.
+- The free live demo can't run Chromium (512 MB). A host with ≥ 2 GB RAM can run the full image.
+- Future work: more approved tools (PDF extraction, sitemap parsing, Lighthouse audits), and stronger sandboxing (gVisor or a separate container per run).
