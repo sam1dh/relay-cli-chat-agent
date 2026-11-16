@@ -264,6 +264,63 @@ def test_crawl4ai_garbage_output_falls_back(site, fake_crwl, monkeypatch):
     assert final["json"]["execution"]["tool"] == "crawl_site"
 
 
+def test_structured_items_and_price_stats():
+    from backend import structure
+    pages = [{"url": "u1", "items": ["Tipping the Velvet — £53.74 · In stock", "A Light in the Attic — £51.77 · In stock",
+                                     "Cheap Book — £10.00", "No Price Heading — In stock"]}]
+    items = structure.extract_items(pages)
+    assert items[0] == {"name": "Tipping the Velvet", "price": "£53.74", "price_value": 53.74, "details": "In stock", "page": "u1"}
+    ps = structure.price_stats(items)
+    assert ps["items_with_price"] == 3 and ps["cheapest"]["name"] == "Cheap Book" and ps["most_expensive"]["price"] == "£53.74"
+
+
+def test_parse_stream_text_tolerant_of_one_line_output():
+    from backend.summarizer import parse_stream_text
+    out = parse_stream_text("Overview text. - Point A here. - Point B. SITE TYPE: blog FOCUS: none SUSPICIOUS: no")
+    assert out["text"] == "Overview text."
+    assert len(out["key_points"]) == 2
+    assert out["site_type"] == "blog"
+    assert out["focus_findings"] is None
+
+
+def test_phoneish_rejects_year_ranges():
+    from backend.crawl4ai_adapter import phoneish
+    assert phoneish("(1800-1849") is False
+    assert phoneish("+91 98765 43210") is True
+
+
+def test_adapter_items_reach_the_summary_digest():
+    from backend import crawl4ai_adapter, summarizer
+    md = "# All products\n**1000** results - showing **1** to **20**.\n### [Tipping the Velvet](u)\n£53.74\nIn stock\n"
+    raw = crawl4ai_adapter.normalise(
+        [{"url": "https://shop.example/all", "success": True, "status_code": 200, "markdown": {"raw_markdown": md}}],
+        "https://shop.example/all", 10, {"max_pages": 5, "max_depth": 1})
+    assert "Tipping the Velvet — £53.74 · In stock" in raw["pages"][0]["items"]
+    text = summarizer.digest(raw)
+    assert "Tipping the Velvet — £53.74 · In stock" in text
+    assert "1000 results" in text
+
+
+def test_cli_extracts_shop_items_and_prices(site, tmp_path):
+    out = tmp_path / "shop.json"
+    p = subprocess.run([sys.executable, str(ROOT / "cli" / "sitecrawl.py"), "--url", site + "/shop.html",
+                        "--max-pages", "1", "--max-depth", "0", "--allow-private", "--delay", "0",
+                        "--output", str(out)], capture_output=True, text=True, timeout=60)
+    assert p.returncode == 0
+    page = json.loads(out.read_text(encoding="utf-8"))["pages"][0]
+    assert page["items"][0].startswith("A Light in the Attic — £51.77")
+    assert "£51.77" in page["prices"]
+    assert page["contacts"]["phones"] == []
+
+
+def test_followup_reuses_previous_site(site):
+    r = TestClient(app).post("/api/chat", json={"message": "i want summary", "last_url": site + "/"})
+    assert r.status_code == 200
+    events = [json.loads(l[6:]) for l in r.text.splitlines() if l.startswith("data: ")]
+    plan = next(e["plan"] for e in events if e["type"] == "plan")
+    assert plan["intent"] == "crawl_site" and plan["url"] == site + "/"
+
+
 def test_nat64_and_mapped_addresses_judged_by_embedded_ipv4():
     import ipaddress
     from backend.validators import _effective_ip

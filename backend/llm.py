@@ -120,6 +120,7 @@ def stream(system: str, user: str, temperature: float = 0.2):
     if r.status_code != 200:
         r.close()
         raise LLMError(f"LLM HTTP {r.status_code}")
+    r.encoding = "utf-8"   # SSE streams often omit charset; requests would default to Latin-1
     with r:
         for raw in r.iter_lines(decode_unicode=True):
             if not raw or not raw.startswith("data:"):

@@ -26,6 +26,10 @@ RUN if [ "$WITH_CRAWL4AI" = "1" ]; then \
 
 # Run as an unprivileged user (least privilege; also what Hugging Face Spaces expects)
 RUN useradd -m -u 1000 appuser
+# Docker leaves HOME=/ for a non-root USER unless it is set explicitly. Crawl4AI creates
+# ~/.crawl4ai (cache, robots, crawler.log) every time a crawler starts, so with HOME=/ `crwl`
+# dies immediately with PermissionError and the app silently falls back to sitecrawl.
+ENV HOME=/home/appuser
 COPY --chown=appuser:appuser . .
 USER appuser
 # Crawl4AI prints per-page [FETCH]/[SCRAPE]/[COMPLETE] logs only when VERBOSE is on

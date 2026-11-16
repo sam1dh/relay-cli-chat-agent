@@ -19,11 +19,23 @@ from urllib.parse import urlparse
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,24}")
 PHONE_RE = re.compile(r"(?<![\w.])\+?\(?\d[\d\s().-]{6,18}\d(?![\w.])")
 MD_LINK_RE = re.compile(r"!?\[([^\]]*)\]\([^)]*\)")
+PRICE_RE = re.compile(r"(?:[£$\u20ac\u20b9]\s?\d[\d,]*(?:\.\d{1,2})?|\b\d[\d,]*(?:\.\d{1,2})?\s?(?:USD|EUR|GBP|INR|Rs\.?)\b)")
+UTILITY_URL = re.compile(r"(/(login|log-in|signin|sign-in|signup|sign-up|register|enter|logout|log-out|cart|basket|checkout|"
+                         r"account|my-account|password|auth|oauth|wp-login\.php|wp-admin)(/|\?|$|\.))|[?&](signup|state=new-user|redirect_to=)", re.I)
+UI_NOISE = re.compile(r"^(add to (basket|cart)|buy now|read more|more info|next|previous|prev|login|log in|sign in|view details|details)\W*$", re.I)
 SOCIAL = ("facebook.com", "twitter.com", "x.com", "linkedin.com", "instagram.com", "youtube.com", "github.com", "tiktok.com")
 
 
 class AdapterError(ValueError):
     pass
+
+
+def phoneish(s: str) -> bool:
+    """Real phone numbers have 9-15 digits; reject year ranges like 1800-1849."""
+    digits = re.sub(r"\D", "", s)
+    if not 9 <= len(digits) <= 15:
+        return False
+    return not re.fullmatch(r"\(?\s*(1[5-9]|20)\d{2}\s*[-\u2013\u2014]\s*(1[5-9]|20)\d{2}\s*\)?", s.strip())
 
 
 def load_output(file_text: str | None, stdout: str) -> list[dict]:
@@ -68,7 +80,9 @@ def _markdown_text(md) -> str:
 
 
 def _clean(s: str) -> str:
-    return re.sub(r"\s+", " ", MD_LINK_RE.sub(r"\1", s or "")).strip()
+    s = MD_LINK_RE.sub(r"\1", s or "")
+    s = re.sub(r"(\*\*|__|`)", "", s)            # bold / code markup
+    return re.sub(r"\s+", " ", s).strip()
 
 
 def to_page(item: dict, depth: int) -> dict:
@@ -76,18 +90,40 @@ def to_page(item: dict, depth: int) -> dict:
     meta = item.get("metadata") or {}
     lines = md.splitlines()
     headings = {"h1": [], "h2": [], "h3": []}
+    items, facts, cur, cur_data = [], [], None, []
+
+    def flush_item():
+        if cur and cur_data:
+            it = cur + " \u2014 " + " \u00b7 ".join(cur_data[:4])
+            if it not in items:
+                items.append(it)
+
     for ln in lines:
-        m = re.match(r"^(#{1,3})\s+(.*)", ln.strip())
+        raw = ln.strip()
+        m = re.match(r"^(#{1,6})\s+(.*)", raw)
         if m:
             h = _clean(m.group(2))
-            if h and h not in headings[f"h{len(m.group(1))}"]:
-                headings[f"h{len(m.group(1))}"].append(h)
-    paragraphs = []
-    for block in re.split(r"\n\s*\n", md):
-        b = block.strip()
-        if not b or b.startswith("#") or b.startswith("|") or b.startswith("```"):
+            lvl = min(len(m.group(1)), 3)
+            if h and h not in headings[f"h{lvl}"]:
+                headings[f"h{lvl}"].append(h)
+            flush_item()
+            cur, cur_data = (h if len(m.group(1)) >= 2 else None), []
             continue
-        t = _clean(re.sub(r"^[-*]\s+", "", b))
+        t = _clean(re.sub(r"^([-*+]|\d+\.)\s+", "", raw))
+        if not t or UI_NOISE.match(t):
+            continue
+        if cur is not None and len(t) <= 80:
+            cur_data.append(t)                  # e.g. "£51.77", "In stock" under a product heading
+        if 4 <= len(t) <= 80 and re.search(r"\d|[£$\u20ac\u20b9]", t) and t not in facts:
+            facts.append(t)                     # short data lines: prices, counts, dates
+    flush_item()
+
+    paragraphs = []
+    for ln in lines:
+        raw = ln.strip()
+        if not raw or raw.startswith(("#", "|", "```", "---", "![")):
+            continue
+        t = _clean(re.sub(r"^([-*+]|\d+\.)\s+", "", raw))
         if len(t) >= 40 and t not in paragraphs:
             paragraphs.append(t)
     links = item.get("links") or {}
@@ -97,7 +133,8 @@ def to_page(item: dict, depth: int) -> dict:
     social = sorted({h for h in hrefs if any((urlparse(h).hostname or "").endswith(d) for d in SOCIAL)})[:15]
     text = _clean(md)
     emails = sorted(set(EMAIL_RE.findall(text)))[:20]
-    phones = sorted({p.strip() for p in PHONE_RE.findall(text) if 8 <= len(re.sub(r"\D", "", p)) <= 15})[:10]
+    phones = sorted({p.strip() for p in PHONE_RE.findall(text) if phoneish(p)})[:10]
+    prices = list(dict.fromkeys(PRICE_RE.findall(text)))[:50]
     title = meta.get("title") or meta.get("og:title") or (headings["h1"][0] if headings["h1"] else None)
     return {
         "url": item.get("url"),
@@ -110,7 +147,10 @@ def to_page(item: dict, depth: int) -> dict:
         "canonical": None,
         "open_graph": {k.split(":", 1)[1]: v for k, v in meta.items() if isinstance(k, str) and k.startswith("og:") and isinstance(v, str)},
         "headings": {k: v[:15] for k, v in headings.items()},
-        "key_paragraphs": paragraphs[:8],
+        "key_paragraphs": paragraphs[:12],
+        "items": items[:40],
+        "facts": facts[:20],
+        "prices": prices,
         "main_text": " ".join(paragraphs)[:4000],
         "word_count": len(text.split()),
         "links": {"internal_count": len(internal), "external_count": len(external),
@@ -123,13 +163,23 @@ def to_page(item: dict, depth: int) -> dict:
 
 
 def normalise(items: list[dict], start_url: str, duration_ms: int, limits: dict) -> dict:
-    pages, errors = [], []
+    pages, errors, beyond, utility = [], [], 0, 0
+    max_depth = limits.get("max_depth")
     for i, it in enumerate(items):
         ok = it.get("success", True) and (it.get("status_code") or 200) < 400
-        if ok:
-            pages.append(to_page(it, 0 if i == 0 else 1))
-        else:
+        if not ok:
             errors.append({"url": it.get("url"), "error": it.get("error_message") or f"HTTP {it.get('status_code')}"})
+            continue
+        page = to_page(it, 0 if i == 0 else 1)
+        if i > 0 and UTILITY_URL.search(f"{page.get('url') or ''} {page.get('final_url') or ''}"):
+            utility += 1
+            continue
+        if max_depth is not None and isinstance(page["depth"], int) and page["depth"] > max_depth:
+            beyond += 1
+            continue
+        pages.append(page)
+    limits = {**limits, "depth_enforcement": "post-filter (crwl CLI uses BFS depth 3)", "pages_discarded_beyond_depth": beyond,
+              "utility_pages_skipped": utility}
     first = pages[0] if pages else {}
     status = "unreachable" if not pages else ("partial" if errors else "success")
     return {

@@ -6,7 +6,7 @@ const el = (tag, cls, html) => { const e = document.createElement(tag); if (cls)
 const scrollDown = () => { chat.scrollTop = chat.scrollHeight; };
 const fmtS = (ms) => (ms / 1000).toFixed(ms < 10000 ? 2 : 1) + " s";
 const TOOL_LABEL = { crawl4ai: "crawl4ai", crawl_site: "sitecrawl", check_site: "curl" };
-let busy = false, health = null;
+let busy = false, health = null, lastUrl = null;
 
 // ---------------------------------------------------------------- health / sidebar
 fetch("/api/health").then((r) => r.json()).then((h) => {
@@ -94,7 +94,7 @@ async function send(message) {
   const u = el("div", "msg-user"); const b = el("div", "bubble"); b.textContent = message; u.appendChild(b); chat.appendChild(u);
   const turn = new Turn(message);
   try {
-    const res = await fetch("/api/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ message }) });
+    const res = await fetch("/api/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ message, last_url: lastUrl }) });
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
       turn.final({ status: "failed", text: typeof err.detail === "string" ? err.detail : `Request rejected (HTTP ${res.status})` });
@@ -138,6 +138,7 @@ class Turn {
   // ---- plan
   plan({ plan: p }) {
     this.planData = p;
+    if (p.url && !p.error) lastUrl = p.url;
     if (p.intent === "chat" || p.intent === "unsupported") return;
     Ins.reset(p);
     const card = el("div", "card");
@@ -167,6 +168,7 @@ class Turn {
 
   // ---- notes (crawler choice, fallback)
   status({ message }) {
+    if (/robots\.txt pre-check/i.test(message)) { Ins.check("robots", true, "pre-checked"); return; }
     if (this.exec) this.line("sys", "[app] " + message);
     if (/fall|not installed/i.test(message)) { const n = el("div", "note"); n.textContent = message; (this.exec?.card || this.stack).appendChild(n); }
     if (/verified/i.test(message)) this.step(4);
@@ -213,6 +215,8 @@ class Turn {
     if (ev.stream === "system") return this.line("sys", "[system] " + ev.line);
     if (!p) {
       if (this.exec.tool === "crawl4ai") {
+        const last = this.exec.term.lastElementChild;
+        if (/^\s*\|/.test(ev.line) && last) { last.lastChild.textContent += " " + ev.line.trim(); return; }
         const tag = (ev.line.match(/^\[(\w+)\]/) || [])[1];
         if (tag === "COMPLETE") this.bumpPages();
         const cls = tag === "COMPLETE" ? "ok" : tag === "FETCH" ? "fetch" : tag === "ERROR" ? "err" : "out";
@@ -223,7 +227,7 @@ class Turn {
     const pr = this.exec.card.querySelector(".pl"), bar = this.exec.card.querySelector(".track i");
     switch (p.event) {
       case "start": return this.line("", `[start] ${p.tool} v${p.version} → ${p.url} (max ${p.max_pages} pages, depth ${p.max_depth})`);
-      case "robots": Ins.check("robots", true, p.status.split("_")[0]); return this.line("", `[robots] ${p.status}${p.url ? " · " + p.url : ""}`);
+      case "robots": Ins.check("robots", true, ({ loaded: "allowed", not_found_allow_all: "no robots.txt", unavailable_allow_all: "unreachable", ignored: "ignored", access_denied_treated_as_disallow: "denied" })[p.status] || p.status); return this.line("", `[robots] ${p.status}${p.url ? " · " + p.url : ""}`);
       case "fetch": Ins.depth = Math.max(Ins.depth, p.depth); Ins.meter("Depth", Ins.depth, Ins.max.d); return this.line("fetch", `→ GET ${p.url}   page ${p.n}/${p.max} · depth ${p.depth}`);
       case "redirect": return this.line("", `  ↪ redirect → ${p.to}`);
       case "page_ok":
@@ -275,9 +279,11 @@ class Turn {
   summaryDelta({ text }) {
     if (!this.streamEl) return;
     this.streamBuf += text;
-    this.streamEl.textContent = this.streamBuf.split("KEY POINTS")[0].trim();
-    if (this.streamBuf.includes("KEY POINTS")) {
-      const pts = this.streamBuf.split("KEY POINTS")[1].split("\n").filter((l) => /^\s*[-•*]/.test(l)).map((l) => l.replace(/^\s*[-•*]\s*/, ""));
+    const buf = this.streamBuf.replace(/\b(SITE TYPE|FOCUS|SUSPICIOUS)\s*:[^\n]*/gi, "");
+    const cut = buf.search(/KEY POINTS|^\s*[-•*]\s+/im);
+    this.streamEl.textContent = (cut >= 0 ? buf.slice(0, cut) : buf).trim();
+    if (cut >= 0) {
+      const pts = buf.slice(cut).split("\n").filter((l) => /^\s*[-•*]\s+\S/.test(l)).map((l) => l.replace(/^\s*[-•*]\s*/, ""));
       let ul = this.streamEl.parentElement.querySelector(".points"); if (!ul) { ul = el("ul", "points"); this.streamEl.after(ul); }
       ul.innerHTML = pts.map((p) => `<li>${esc(p)}</li>`).join("");
     }
@@ -330,6 +336,7 @@ class Turn {
     } else {
       const sm = ev.summary || {}, data = env?.data || {};
       if (data.stats && this.exec) this.bumpPages(data.stats.pages_crawled);
+      if (data.pages?.length) { const d = Math.max(...data.pages.map((p) => p.depth || 0)); Ins.meter("Depth", d, Ins.max.d); }
       card.querySelector(".headline").textContent = ev.headline || "Completed";
       card.querySelector(".rby").textContent = sm.generated_by === "llm" ? `Summary by ${health?.llm?.replace(/^.*\((.*)\)$/, "$1") || "LLM"}` : "Extractive summary (no LLM)";
       const stats = card.querySelector(".stats");
@@ -343,15 +350,14 @@ class Turn {
           .map(([k, v, s], i) => `<div class="stat"><span>${k}</span><b class="${i === 3 ? (exec?.exit_code === 0 ? "good" : "bad") : ""}" style="${String(v).length > 10 ? "font-size:16px" : ""}">${esc(v)}</b><small>${esc(s)}</small></div>`).join("");
       } else stats.remove();
       const sumPane = card.querySelector('[data-pane="summary"]');
-      if (ev.show_summary !== false) {
-        sumPane.innerHTML = `<p class="summary-text">${esc(sm.text)}</p>${sm.key_points?.length ? `<ul class="points">${sm.key_points.map((k) => `<li>${esc(k)}</li>`).join("")}</ul>` : ""}
+      sumPane.innerHTML = `<p class="summary-text">${esc(sm.text)}</p>${sm.key_points?.length ? `<ul class="points">${sm.key_points.map((k) => `<li>${esc(k)}</li>`).join("")}</ul>` : ""}
           ${sm.focus_findings ? `<div class="focus"><b>Focus:</b> ${esc(sm.focus_findings)}</div>` : ""}
           ${sm.suspicious_content_detected ? `<div class="warnbox">⚠ <b>Possible prompt injection ignored.</b> A crawled page contained instruction-like text. Website content is treated as untrusted data and cannot trigger commands.</div>` : ""}
           ${sm.note ? `<p class="byline">${esc(sm.note)}</p>` : ""}${sm.site_type ? `<p class="byline">Site type: ${esc(sm.site_type)}</p>` : ""}`;
-      } else sumPane.innerHTML = `<p class="byline">You asked for JSON only. See the JSON tab.</p>`;
+      sumPane.appendChild(renderStructured(data));
       if (data.pages?.length) {
         card.querySelector('[data-pane="pages"]').innerHTML = `<table class="pages"><thead><tr><th>#</th><th>STATUS</th><th>URL</th><th>TITLE</th><th>WORDS</th></tr></thead><tbody>
-          ${data.pages.map((p, i) => `<tr><td>${i + 1}</td><td><span class="code">${p.status_code ?? 200}</span></td><td class="url"><a href="${esc(p.url)}" target="_blank" rel="noopener noreferrer">${esc(p.url)}</a></td><td>${esc(p.title || "-")}</td><td>${p.word_count ?? ""}</td></tr>`).join("")}
+          ${data.pages.map((p, i) => `<tr><td>${i + 1}</td><td><span class="code ${p.status_code >= 300 && p.status_code < 400 ? "redir" : ""}">${p.status_code ?? 200}</span></td><td class="url"><a href="${esc(p.url)}" target="_blank" rel="noopener noreferrer">${esc(p.url)}</a></td><td>${esc(p.title || "-")}</td><td>${p.word_count ?? ""}</td></tr>`).join("")}
           ${(data.errors || []).map((e) => `<tr><td>✗</td><td><span class="code bad">ERR</span></td><td class="url">${esc(e.url)}</td><td colspan="2" style="color:var(--red-text)">${esc(e.error)}</td></tr>`).join("")}</tbody></table>`;
         tabs.querySelector('[data-t="pages"]').textContent = `Pages (${data.pages.length})`;
       } else tabs.querySelector('[data-t="pages"]')?.remove();
@@ -365,7 +371,7 @@ class Turn {
       jp.innerHTML = `<div class="json-bar"><span class="pill green">✓ valid JSON</span><span style="flex:1"></span><button class="btn cp" type="button">Copy</button><button class="btn dl" type="button">Download .json</button></div><pre class="json">${highlight(pretty)}</pre>`;
       jp.querySelector(".cp").addEventListener("click", (e) => { navigator.clipboard?.writeText(pretty); e.target.textContent = "Copied ✓"; });
       jp.querySelector(".dl").addEventListener("click", () => { const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([pretty], { type: "application/json" })); a.download = `${exec?.run_id || "relay-result"}.json`; a.click(); });
-      if (ev.json_requested && ok && ev.show_summary === false) card.querySelector('[data-t="json"]').click();
+      if (ok && ev.show_summary === false) card.querySelector('[data-t="json"]').click();
     } else tabs.querySelector('[data-t="json"]')?.remove();
     if (exec?.run_id) {
       const rp = card.querySelector('[data-pane="raw"]');
@@ -375,6 +381,50 @@ class Turn {
     }
     scrollDown();
   }
+}
+
+function renderStructured(data) {
+  const box = el("div", "structured");
+  const items = data.extracted_items || [], ps = data.price_stats;
+  if (ps) {
+    const c = ps.currency || "";
+    box.insertAdjacentHTML("beforeend", `<div class="chips-row">
+      <span class="kchip"><small>ITEMS WITH PRICE</small><b>${ps.items_with_price}</b></span>
+      <span class="kchip"><small>LOWEST</small><b>${esc(ps.cheapest.price)}</b><em>${esc(ps.cheapest.name)}</em></span>
+      <span class="kchip"><small>HIGHEST</small><b>${esc(ps.most_expensive.price)}</b><em>${esc(ps.most_expensive.name)}</em></span>
+      <span class="kchip"><small>AVERAGE</small><b>${esc(c)}${ps.average.toFixed(2)}</b></span></div>`);
+  }
+  if (items.length) {
+    const hasPrice = items.some((i) => i.price), hasDet = items.some((i) => i.details);
+    const sec = el("div", "items-sec");
+    sec.innerHTML = `<div class="sec-head"><span class="label">EXTRACTED ITEMS (${items.length})</span><span class="src">from CLI output · not generated by the LLM</span></div>
+      <table class="items"><thead><tr><th>#</th><th class="sort" data-k="name">ITEM \u2195</th>${hasPrice ? `<th class="sort num" data-k="price_value">PRICE \u2195</th>` : ""}${hasDet ? "<th>DETAILS</th>" : ""}<th>PAGE</th></tr></thead><tbody></tbody></table>
+      ${items.length > 10 ? `<button class="btn more" type="button">Show all ${items.length}</button>` : ""}`;
+    let rows = items.slice(), showAll = false, dir = {};
+    const tb = sec.querySelector("tbody");
+    const draw = () => {
+      tb.innerHTML = (showAll ? rows : rows.slice(0, 10)).map((i, n) => `<tr><td>${n + 1}</td><td class="iname">${esc(i.name)}</td>
+        ${hasPrice ? `<td class="num price">${esc(i.price || "\u2014")}</td>` : ""}${hasDet ? `<td class="det">${esc(i.details || "")}</td>` : ""}
+        <td class="pg"><a href="${esc(i.page)}" target="_blank" rel="noopener noreferrer">${esc((i.page || "").replace(/^https?:\/\/[^/]+/, "") || "/")}</a></td></tr>`).join("");
+    };
+    sec.querySelectorAll("th.sort").forEach((th) => th.addEventListener("click", () => {
+      const k = th.dataset.k; dir[k] = -(dir[k] || -1);
+      rows.sort((a, b) => ((a[k] ?? Infinity) > (b[k] ?? Infinity) ? 1 : (a[k] ?? Infinity) < (b[k] ?? Infinity) ? -1 : 0) * dir[k]);
+      draw();
+    }));
+    sec.querySelector(".more")?.addEventListener("click", (e) => { showAll = !showAll; e.target.textContent = showAll ? "Show fewer" : `Show all ${items.length}`; draw(); });
+    draw(); box.appendChild(sec);
+  } else {
+    const hl = [];
+    (data.pages || []).forEach((p) => (p.key_paragraphs || []).forEach((t) => { if (hl.length < 8 && !hl.some((h) => h.t === t)) hl.push({ t, u: p.url }); }));
+    if (hl.length) {
+      const sec = el("div", "items-sec");
+      sec.innerHTML = `<div class="sec-head"><span class="label">HIGHLIGHTS FROM THE PAGES</span><span class="src">verbatim from CLI output</span></div>
+        <div class="hl">${hl.map((h) => `<blockquote>${esc(h.t)}<a href="${esc(h.u)}" target="_blank" rel="noopener noreferrer">${esc((h.u || "").replace(/^https?:\/\/[^/]+/, "") || "/")}</a></blockquote>`).join("")}</div>`;
+      box.appendChild(sec);
+    }
+  }
+  return box;
 }
 
 function highlight(json) {

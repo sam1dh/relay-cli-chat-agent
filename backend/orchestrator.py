@@ -12,14 +12,14 @@ import re
 from datetime import datetime, timezone
 from typing import Iterator
 
-from . import config, crawl4ai_adapter, executor, intent, summarizer, tools
+from . import config, crawl4ai_adapter, executor, intent, structure, summarizer, tools
 
 LABEL = {"crawl_site": "sitecrawl", "crawl4ai": "crawl4ai", "check_site": "curl"}
 REQUIRED_CRAWL_KEYS = {"tool", "status", "start_url", "stats", "site", "pages", "errors"}
 
 
-def handle(message: str) -> Iterator[dict]:
-    plan = intent.parse(message)
+def handle(message: str, last_url: str | None = None) -> Iterator[dict]:
+    plan = intent.parse(message, last_url)
     yield {"type": "plan", "plan": plan.to_dict()}
 
     if plan.intent in ("chat", "unsupported"):
@@ -48,10 +48,12 @@ def handle(message: str) -> Iterator[dict]:
     attempts_plan, note = _crawler_chain()
     if note:
         yield {"type": "status", "message": note}
-    if attempts_plan[0] == "crawl4ai" and not _robots_allows(plan.url):
-        yield _fail(message, plan, None, "blocked",
-                    "The site's robots.txt does not allow crawling this URL, so no crawler was started.")
-        return
+    if attempts_plan[0] == "crawl4ai":
+        if not _robots_allows(plan.url):
+            yield _fail(message, plan, None, "blocked",
+                        "The site's robots.txt does not allow crawling this URL, so no crawler was started.")
+            return
+        yield {"type": "status", "message": "robots.txt pre-check passed"}
 
     attempts = []
     raw = end = exec_info = None
@@ -59,7 +61,7 @@ def handle(message: str) -> Iterator[dict]:
         spec = tools.get(name)
         end, exec_info = yield from _run(spec, params)
         if (bad := _process_problem(end, exec_info, spec)):
-            if end.get("timed_out") or end.get("cancelled") or i == len(attempts_plan) - 1:
+            if end.get("cancelled") or i == len(attempts_plan) - 1:
                 exec_info["attempts"] = attempts + [{"tool": name, "exit_code": end.get("exit_code"), "outcome": bad[0]}]
                 yield _fail(message, plan, exec_info, *bad)
                 return
@@ -194,7 +196,10 @@ def _finish_crawl(message, plan, end, exec_info, raw) -> Iterator[dict]:
     except StopIteration as stop:
         summary = stop.value
 
-    data = {"site": raw["site"], "stats": raw["stats"], "pages": [_slim_page(p) for p in raw["pages"]],
+    items = structure.extract_items(raw["pages"])
+    data = {"site": raw["site"], "stats": raw["stats"],
+            "extracted_items": items, "price_stats": structure.price_stats(items),
+            "pages": [_slim_page(p) for p in raw["pages"]],
             "errors": raw["errors"], "limits": raw.get("limits"), "crawler": raw.get("tool")}
     envelope = _envelope(message, plan, status, exec_info, summary, data)
     json.loads(json.dumps(envelope))  # guarantee syntactically valid JSON
@@ -203,7 +208,7 @@ def _finish_crawl(message, plan, end, exec_info, raw) -> Iterator[dict]:
     headline = (f"Crawl completed · {raw['stats']['pages_crawled']} page(s) verified" if status == "success" else
                 f"Crawl completed · {raw['stats']['pages_crawled']} of {raw['stats']['pages_crawled'] + len(raw['errors'])} pages succeeded")
     yield {"type": "final", "status": status, "headline": headline, "summary": summary,
-           "json": envelope if plan.want_json else None, "json_requested": plan.want_json,
+           "json": envelope, "json_requested": plan.want_json,
            "show_summary": plan.want_summary}
 
 
@@ -216,6 +221,9 @@ def _slim_page(p: dict) -> dict:
         "meta_description": p.get("meta_description"),
         "headings": {k: v[:8] for k, v in (p.get("headings") or {}).items() if v},
         "key_paragraphs": [x[:500] for x in (p.get("key_paragraphs") or [])[:4]],
+        "items": (p.get("items") or [])[:20],
+        "prices": (p.get("prices") or [])[:20],
+        "facts": (p.get("facts") or [])[:10],
         "word_count": p.get("word_count"),
         "contacts": p.get("contacts"),
         "links": {"internal": p.get("links", {}).get("internal_count"),

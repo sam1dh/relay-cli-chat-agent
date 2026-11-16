@@ -90,6 +90,19 @@ SOCIAL_DOMAINS = (
     "youtube.com", "github.com", "tiktok.com", "pinterest.com", "medium.com", "t.me",
 )
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,24}")
+PRICE_RE = re.compile(r"(?:[£$\u20ac\u20b9]\s?\d[\d,]*(?:\.\d{1,2})?|\b\d[\d,]*(?:\.\d{1,2})?\s?(?:USD|EUR|GBP|INR|Rs\.?)\b)")
+UTILITY_URL = re.compile(r"(/(login|log-in|signin|sign-in|signup|sign-up|register|enter|logout|log-out|cart|basket|checkout|"
+                         r"account|my-account|password|auth|oauth|wp-login\.php|wp-admin)(/|\?|$|\.))|[?&](signup|state=new-user|redirect_to=)", re.I)
+
+
+def phoneish(s: str) -> bool:
+    """Real phone numbers have 9-15 digits; reject year ranges like 1800-1849."""
+    digits = re.sub(r"\D", "", s)
+    if not 9 <= len(digits) <= 15:
+        return False
+    return not re.fullmatch(r"\(?\s*(1[5-9]|20)\d{2}\s*[-\u2013\u2014]\s*(1[5-9]|20)\d{2}\s*\)?", s.strip())
+
+
 PHONE_RE = re.compile(r"(?<![\w.])\+?\(?\d[\d\s().-]{6,18}\d(?![\w.])")
 
 
@@ -248,8 +261,10 @@ class Crawler:
 
     # ---- extraction -----------------------------------------------------
     def extract(self, url: str, resp: requests.Response, depth: int) -> tuple[dict, list[str]]:
-        html = resp.content.decode(resp.encoding or resp.apparent_encoding or "utf-8", errors="replace")
-        soup = BeautifulSoup(html, "html.parser")
+        if "charset=" in resp.headers.get("Content-Type", "").lower():
+            soup = BeautifulSoup(resp.content.decode(resp.encoding, errors="replace"), "html.parser")
+        else:
+            soup = BeautifulSoup(resp.content, "html.parser")   # reads <meta charset>, avoids "£"
 
         def meta(name=None, prop=None):
             tag = soup.find("meta", attrs={"name": name}) if name else soup.find("meta", attrs={"property": prop})
@@ -283,6 +298,23 @@ class Crawler:
         for tag in soup(["script", "style", "noscript", "template", "svg", "iframe"]):
             tag.decompose()
 
+        items = []
+        for card in soup.find_all(["article", "li"]):
+            heads = card.find_all(["h2", "h3", "h4"])
+            if len(heads) != 1 or len(card.get_text(" ", strip=True)) > 400:
+                continue
+            a = heads[0].find("a")
+            name = clean_text((a.get("title") if a and a.get("title") else heads[0].get_text(" ")))
+            data = []
+            for el in card.find_all(["p", "span", "div"]):
+                t = clean_text(el.get_text(" "))
+                if t and t != name and len(t) <= 40 and t not in data and not el.find(["p", "div"]):
+                    data.append(t)
+            if name and data:
+                item = name + " \u2014 " + " \u00b7 ".join(data[:4])
+                if item not in items:
+                    items.append(item)
+
         headings = {}
         for level in ("h1", "h2", "h3"):
             vals = [clean_text(h.get_text()) for h in soup.find_all(level)]
@@ -300,7 +332,17 @@ class Crawler:
         main_text = " ".join(paragraphs)[:MAX_TEXT_CHARS]
 
         emails = sorted({e for e in EMAIL_RE.findall(full_text) if not e.lower().endswith((".png", ".jpg", ".gif", ".webp"))} | mailtos)[:20]
-        phones = sorted({clean_text(p) for p in PHONE_RE.findall(full_text) if 8 <= len(re.sub(r"\D", "", p)) <= 15} | tels)[:10]
+        phones = sorted({clean_text(p) for p in PHONE_RE.findall(full_text) if phoneish(p)} | tels)[:10]
+        prices = list(dict.fromkeys(PRICE_RE.findall(full_text)))[:50]
+        facts = []
+        for el in soup.find_all(["p", "span", "strong", "li", "div"]):
+            if el.find(["p", "div", "li"]):
+                continue
+            t = clean_text(el.get_text(" "))
+            if 4 <= len(t) <= 80 and re.search(r"\d|[£$\u20ac\u20b9]", t) and t not in facts:
+                facts.append(t)
+            if len(facts) >= 20:
+                break
 
         page = {
             "url": url,
@@ -317,6 +359,7 @@ class Crawler:
             }.items() if v},
             "headings": headings,
             "key_paragraphs": paragraphs[:8],
+            "items": items[:40], "facts": facts[:20], "prices": prices,
             "main_text": main_text,
             "word_count": len(full_text.split()),
             "links": {
@@ -388,6 +431,7 @@ class Crawler:
                             l for l in links
                             if l not in seen and same_site(l, start_url)
                             and not urlparse(l).path.lower().endswith(SKIP_EXTENSIONS)
+                            and not UTILITY_URL.search(l)
                         ]
                         candidates.sort(key=link_priority)
                         for l in candidates:

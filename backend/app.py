@@ -28,6 +28,7 @@ RATE_LIMIT = 20  # requests per minute per client IP
 
 class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=config.MAX_PROMPT_CHARS)
+    last_url: str | None = Field(None, max_length=2048)
 
 
 def _rate_ok(ip: str) -> bool:
@@ -66,7 +67,7 @@ def chat(req: ChatRequest, request: Request):
 
     def stream():
         try:
-            for event in orchestrator.handle(req.message):
+            for event in orchestrator.handle(req.message, req.last_url):
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
         except Exception as e:  # never leak a traceback / secrets to the client
             err = {"type": "final", "status": "failed", "text": f"Internal error ({type(e).__name__}). The task did not complete."}
